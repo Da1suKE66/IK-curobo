@@ -4,3 +4,7 @@ __pycache__/
 /firefly-sim-ik/
 /firefly-sim-ik-linux-x86_64.tar.gz
 /hardware_model/
+/verification.json
+/audit_results/*.json
+/audit_results/*.npz
+/audit_results/*.png
