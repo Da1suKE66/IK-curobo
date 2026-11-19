@@ -157,6 +157,56 @@ def continuity(sim, side, solver, name, references, limits):
                 max_output_joint_step_rad=max_output, worst_step=worst, events=events)
 
 
+def similar_singular_poses(sim, side, solver, home, limits):
+    """Solve fresh FK witnesses near a coupled wrist pole and elbow tangency."""
+    link3 = sim.plant.model.body(f"{side}_link_3").pos
+    link4 = sim.plant.model.body(f"{side}_link_4").pos
+    tangent = np.arctan2(link3[0], link3[2]) - np.arctan2(link4[0], link4[2])
+    rows = []
+    for sign in (-1, 1):
+        for inset in (0., 7e-8, 4e-5):
+            # Different J1/J2/J4/J6 from the frozen M targets. The solver
+            # receives only the FK target and the standard home starting pose.
+            q = np.array([-.64, .27, tangent + 1.3 * inset, .72,
+                          sign * (np.pi / 2 - inset), -.83])
+            target = sim.fk(side, q)
+            candidate, trial = evaluate(sim, side, solver, target, home, limits)
+            passed = bool(candidate is not None and trial["position_error_m"] <= 1.1e-8
+                          and trial["orientation_error_rad"] <= 1.1e-7)
+            rows.append(dict(sign=sign, inset_rad=inset, passed=passed, **trial))
+    return rows
+
+
+def stress_singular_poses(sim, side, solver, rng):
+    """Probe two intersecting singular families over broad random arm postures."""
+    home = sim.joints(side)
+    lower, upper = sim.plant.limits[sim.plant.arm_drives[side]].T
+    p3, p4 = (sim.plant.model.body(f"{side}_link_{j}").pos for j in (3, 4))
+    tangent = np.arctan2(p3[0], p3[2]) - np.arctan2(p4[0], p4[2])
+    insets = (0., 1e-12, 1e-9, 1e-7, 1e-6, 1e-5, 1e-4)
+    failures = []
+    worst_position = worst_angle = 0.
+    for index in range(500):
+        q = rng.uniform(lower, upper)
+        if index % 3:
+            q[2] = tangent + rng.uniform(-1, 1) * 10**rng.uniform(-10, -3)
+        sign = 1 if index % 2 else -1
+        q[4] = sign * (np.pi / 2 - insets[index % len(insets)])
+        target = sim.fk(side, q)
+        result = solver.solve(*target, home)
+        if result is None:
+            failures.append(dict(index=index, status="no_solution", witness_rad=q.tolist()))
+            continue
+        distance, angle = pose_error(sim.fk(side, result), target)
+        worst_position = max(worst_position, distance)
+        worst_angle = max(worst_angle, angle)
+        if distance > 1.1e-8 or angle > 1.1e-7:
+            failures.append(dict(index=index, status="fk_error", witness_rad=q.tolist(),
+                                 position_error_m=distance, orientation_error_rad=angle))
+    return dict(count=500, passed=500-len(failures), worst_position_error_m=worst_position,
+                worst_orientation_error_rad=worst_angle, failures=failures)
+
+
 def run_ik_tests(sim, controller):
     arms = {}
     failed, path_misses, jumps, amplified = 0, 0, 0, 0
@@ -185,10 +235,43 @@ def run_ik_tests(sim, controller):
         path_misses += sum(path["missed"] for path in paths)
         jumps += sum(path["jumps"] for path in paths)
         amplified += sum(path["amplified_steps"] for path in paths)
-        arms[side] = dict(reachability=coverage, continuity=paths)
+        similar = similar_singular_poses(sim, side, solver, home, limits)
+        failed += sum(not trial["passed"] for trial in similar)
+        arms[side] = dict(reachability=coverage, continuity=paths, similar_singular_poses=similar)
     return dict(passed=failed == path_misses == jumps == amplified == 0, failed_seeded_trials=failed,
                 missed_path_steps=path_misses, path_jumps=jumps, amplified_path_steps=amplified,
                 jump_threshold_deg=float(np.rad2deg(JUMP_RAD)),
                 amplified_step_threshold_deg=float(np.rad2deg(AMPLIFIED_STEP_RAD)),
                 amplification_factor=AMPLIFICATION_FACTOR,
                 interior_sample_seed=SAMPLE_SEED, arms=arms)
+
+
+if __name__ == "__main__":
+    import argparse
+    from contextlib import closing, redirect_stdout
+    import json
+    import sys
+    import torch
+
+    from simulation import SIM_ROOT, Simulation
+    from solver import Solver
+
+    parser = argparse.ArgumentParser(description="Test fresh Firefly wrist and elbow singularity neighbours.")
+    parser.add_argument("--stress", action="store_true", help="also test 500 seeded random postures per arm")
+    args = parser.parse_args()
+    torch.manual_seed(54388)
+    rng = np.random.default_rng(54388)
+    with redirect_stdout(sys.stderr), closing(Simulation()) as sim:
+        results = {}
+        stress = {}
+        for arm in SIDES:
+            limits = sim.plant.limits[sim.plant.arm_drives[arm]]
+            solver = Solver(SIM_ROOT, arm)
+            results[arm] = similar_singular_poses(sim, arm, solver, sim.joints(arm), limits)
+            if args.stress:
+                stress[arm] = stress_singular_poses(sim, arm, solver, rng)
+    passed = all(row["passed"] for rows in results.values() for row in rows)
+    report = dict(rng_seed=54388, neighbours=results, stress=stress,
+                  passed=passed and all(not entry["failures"] for entry in stress.values()))
+    print(json.dumps(report, indent=2, allow_nan=False))
+    sys.exit(0 if report["passed"] else 1)

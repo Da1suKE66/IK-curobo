@@ -4,6 +4,7 @@ import xml.etree.ElementTree as ET
 
 import numpy as np
 from hardware import model_paths
+from pose_refinement import ArmGeometry
 
 
 def _robot_config(sim_root, side):
@@ -65,6 +66,12 @@ class Solver:
             load_collision_spheres=False,
         )
         self._ik = InverseKinematics(config)
+        # cuRobo 0.9's LM seeds use an inset at each stop. The calibrated
+        # plant permits both endpoints; we recheck them in float64 below.
+        lm = self._ik.seed_ik_solver
+        lm.action_min.copy_(lm.joint_limits.position[0])
+        lm.action_max.copy_(lm.joint_limits.position[1])
+        self.geometry = ArmGeometry(model_paths(sim_root)[0], side)
         self._num_seeds = num_seeds
         self._tcp = f"{side}_tcp"
         names = [f"{side}_joint_{i}" for i in range(1, 7)]
@@ -74,18 +81,11 @@ class Solver:
         self._to_solver = [names.index(name) for name in solver_names]
         self._to_sim = [solver_names.index(name) for name in names]
 
-    def solve(self, xyz_m, quat_wxyz, seed_rad):
-        """Return the converged IK branch nearest the measured joints, or None."""
+    def _gpu_seeds(self, xyz, quat, seed):
         from curobo.types import GoalToolPose, JointState, Pose
 
-        xyz = _vector(xyz_m, 3, "xyz_m")
-        quat = _vector(quat_wxyz, 4, "quat_wxyz")
-        norm = np.linalg.norm(quat)
-        if not np.isfinite(norm) or norm < 1e-12:
-            raise ValueError("quat_wxyz must have a finite nonzero norm")
-        seed = _vector(seed_rad, 6, "seed_rad")
         to_device = self._ik.device_cfg.to_device
-        pose = Pose(position=to_device(xyz[None]), quaternion=to_device((quat / norm)[None]))
+        pose = Pose(position=to_device(xyz[None]), quaternion=to_device(quat[None]))
         goal = GoalToolPose.from_poses({self._tcp: pose}, num_goalset=1)
         current = JointState.from_position(
             to_device(seed[self._to_solver][None]), joint_names=self._ik.joint_names
@@ -93,8 +93,41 @@ class Solver:
         result = self._ik.solve_pose(goal, current_state=current, return_seeds=self._num_seeds)
         valid = result.success[0].detach().cpu().numpy().astype(bool)
         solutions = result.solution[0].detach().cpu().numpy()[:, self._to_sim]
-        candidates = solutions[valid & np.isfinite(solutions).all(axis=1)]
-        if not candidates.size:
-            return None
-        best = np.argmin(np.linalg.norm(candidates - seed, axis=1))
-        return candidates[best].astype(float)
+        return solutions[valid & np.isfinite(solutions).all(axis=1)].astype(float)
+
+    def _candidates(self, xyz_m, quat_wxyz, seed_rad, *, all_branches):
+        xyz = _vector(xyz_m, 3, "xyz_m")
+        quat = _vector(quat_wxyz, 4, "quat_wxyz")
+        scale = np.max(np.abs(quat))
+        if scale == 0:
+            raise ValueError("quat_wxyz must have a finite nonzero norm")
+        quat = quat / scale
+        quat /= np.linalg.norm(quat)
+        seed = _vector(seed_rad, 6, "seed_rad")
+        gpu = self._gpu_seeds(xyz, quat, seed)
+        geometry = self.geometry
+        # Feedback carries the wrist phase that a TCP on a pole cannot observe.
+        local = geometry.refine(xyz, quat, seed)
+        if not all_branches and local is not None and np.linalg.norm(local - seed) < .04:
+            return [local]
+        candidates = [] if local is None else [local]
+        starts = [*geometry.planar_seeds(xyz, quat, seed), *gpu]
+        starts.sort(key=lambda q: np.linalg.norm(q - seed))
+        tried = []
+        for guess in starts:
+            if any(np.max(np.abs(guess - previous)) < 1e-6 for previous in tried):
+                continue
+            tried.append(guess)
+            candidate = geometry.refine(xyz, quat, guess)
+            if candidate is not None and all(np.max(np.abs(candidate - other)) > 1e-6 for other in candidates):
+                candidates.append(candidate)
+        return sorted(candidates, key=lambda q: np.linalg.norm(q - seed))
+
+    def solve(self, xyz_m, quat_wxyz, seed_rad):
+        """Continue the measured arm branch, preferring small joint displacement."""
+        candidates = self._candidates(xyz_m, quat_wxyz, seed_rad, all_branches=False)
+        return candidates[0] if candidates else None
+
+    def solve_candidates(self, xyz_m, quat_wxyz, seed_rad):
+        """Return distinct, verified branches ordered by distance from the seed."""
+        return self._candidates(xyz_m, quat_wxyz, seed_rad, all_branches=True)

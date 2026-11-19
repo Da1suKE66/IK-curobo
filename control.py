@@ -32,29 +32,45 @@ class Controller:
             if side not in self.solvers:
                 from solver import Solver
                 self.solvers[side] = Solver(SIM_ROOT, side)
-            joints = self.solvers[side].solve(xyz, quat, self.sim.joints(side))
+            solver = self.solvers[side]
+            seed = self.sim.joints(side)
+            if move:
+                candidates = solver.solve_candidates(xyz, quat, seed)
+                if not candidates:
+                    return dict(status="ik_failed", arm=side, sim_time_s=float(self.sim.plant.data.time))
+                solutions[side] = candidates
+                continue
+            joints = solver.solve(xyz, quat, seed)
             if joints is None:
                 return dict(status="ik_failed", arm=side, sim_time_s=float(self.sim.plant.data.time))
-            solutions[side] = joints
-            if not move:
-                actual = self.sim.fk(side, joints)
-                errors = pose_error(actual, (xyz, quat))
-                arms[side] = dict(**arm_state(joints, actual), position_error_m=errors[0],
-                                  orientation_error_rad=errors[1])
-                if not within_tolerance(errors):
-                    return dict(status="candidate_fk_failed", arm=side, arms=arms)
+            actual = self.sim.fk(side, joints)
+            errors = pose_error(actual, (xyz, quat))
+            arms[side] = dict(**arm_state(joints, actual), position_error_m=errors[0],
+                              orientation_error_rad=errors[1])
+            if not within_tolerance(errors):
+                return dict(status="candidate_fk_failed", arm=side, arms=arms)
 
         if move:
-            return self.sim.execute(solutions, goals)
+            from motion import move_to
+            return move_to(self.sim, solutions, goals)
         return dict(status="solved", arms=arms)
+
+    def track(self, times_s, targets_by_arm, *, hold_s=0.4):
+        """Track a sequence of workcell TCP poses at the supplied timestamps."""
+        from trajectory import track
+        return track(self, times_s, targets_by_arm, hold_s=hold_s)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--payload-kg", nargs=2, type=float, metavar=("LEFT", "RIGHT"),
+                        help="known mass at each TCP in kg (move/track/demo)")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("state", help="read measured joints and TCPs at home")
     commands.add_parser("demo", help="move both TCPs by +18 mm in X and +8 mm in Z")
     commands.add_parser("verify", help="run the packaged IK cases and bilateral motion checks")
+    track = commands.add_parser("track", help="follow timestamped workcell TCP waypoints")
+    track.add_argument("file", type=Path, help="JSON with times_s, targets_by_arm and optional hold_s")
     audit = commands.add_parser("audit", help="test IK coverage, collisions, torque and joint continuity")
     audit.add_argument("--trace", type=Path, metavar="FILE.npz", help="save per-step motor telemetry")
     for name, help_text in (("solve", "compute and check IK"), ("move", "solve and drive the simulation")):
@@ -64,6 +80,9 @@ def main():
                                  metavar=("X", "Y", "Z", "QW", "QX", "QY", "QZ"),
                                  help=f"{side} TCP goal in workcell_base (metres, quaternion wxyz)")
     args = parser.parse_args()
+    if args.payload_kg and args.command not in ("move", "track", "demo"):
+        parser.error("--payload-kg applies to move, track or demo")
+    payload = dict(zip(SIDES, args.payload_kg)) if args.payload_kg else {}
     targets = {}
     if args.command in ("solve", "move"):
         for side in SIDES:
@@ -75,13 +94,16 @@ def main():
 
     try:
         # Keep the CLI's stdout machine-readable even on the first CUDA kernel build.
-        with redirect_stdout(sys.stderr), closing(Simulation()) as sim:
+        with redirect_stdout(sys.stderr), closing(Simulation(payload_kg=payload)) as sim:
             controller = Controller(sim)
             if args.command == "state":
                 result = dict(status="ready", arms={s: arm_state(sim.joints(s), sim.tcp(s)) for s in SIDES})
             elif args.command == "verify":
                 from verify import verify
                 result = verify(sim, controller)
+            elif args.command == "track":
+                packet = json.loads(args.file.read_text())
+                result = controller.track(packet["times_s"], packet["targets_by_arm"], hold_s=packet.get("hold_s", 0.4))
             elif args.command == "audit":
                 from audit import run_audit
                 result = run_audit(sim, controller, args.trace)
@@ -91,7 +113,7 @@ def main():
                         xyz, quat = sim.tcp(side)
                         targets[side] = (xyz + [0.018, 0, 0.008], quat)
                 result = controller.run(targets, move=args.command != "solve")
-    except (ValueError, RuntimeError, ImportError, OSError) as exc:
+    except (ValueError, KeyError, RuntimeError, ImportError, OSError) as exc:
         print(json.dumps(dict(status="error", message=str(exc)), ensure_ascii=False), file=sys.stderr)
         return 2
     print(json.dumps(result, indent=2, ensure_ascii=False, allow_nan=False))

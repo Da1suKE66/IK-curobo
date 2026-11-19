@@ -1,9 +1,14 @@
 """Apply Firefly arm joint targets and measure the TCP in the MuJoCo workcell."""
 from pathlib import Path
+from tempfile import NamedTemporaryFile
+import xml.etree.ElementTree as ET
 import sys
+from threading import Lock
+
+import mujoco as mj
 
 import numpy as np
-from hardware import model_paths
+from hardware import MAX_OVERLOAD_S, RATED_TORQUE_NM, model_paths
 
 
 SIM_ROOT = Path(__file__).resolve().parent / "firefly-sim-ik"
@@ -40,10 +45,114 @@ def within_tolerance(errors):
     return distance < IK_POSITION_TOL_M and angle < IK_ORIENTATION_TOL_RAD
 
 
+class GuardedFirefly(Firefly):
+    """Integrate one motor budget per drive, shared across successive commands."""
+
+    def __init__(self, scene):
+        super().__init__(scene=scene)
+        self.drive_joints = self.model.actuator_trnid[:, 0].copy()
+        self.rated = np.empty(self.model.nu)
+        for side in SIDES:
+            self.rated[self.arm_drives[side]] = RATED_TORQUE_NM[:6]
+            self.rated[self.grip_drive[side]] = RATED_TORQUE_NM[6]
+        # Leave a 2% command-speed margin for the compliant finger linkage.
+        # The measured J7 speed is still checked against the packaged 1.5 rad/s.
+        self.command_step = self.max_step.copy()
+        self.command_step[list(self.grip_drive.values())] *= .98
+        self.hard_range = self.model.jnt_actfrcrange[self.drive_joints].copy()
+        self.burst_steps = int(np.floor(MAX_OVERLOAD_S / self.model.opt.timestep))
+        self._step_lock = Lock()
+
+    def reset(self):
+        super().reset()
+        self.overload = np.zeros(self.model.nu, dtype=np.int64)
+
+    def step_control(self, data, command, overload):
+        """Take one 2 ms step on live or scratch data with its own overload counters.
+
+        After a full burst, use joint-level force ranges so gravity compensation
+        also counts. Re-arm only when the *unclipped* torque demand subsides.
+        """
+        if not np.all(np.isfinite(command)):
+            raise ValueError("Drive command must be finite")
+        data.ctrl += np.clip(np.clip(command, *self.limits.T) - data.ctrl, -self.command_step, self.command_step)
+        locked = overload >= self.burst_steps
+        self._integrate_or_forward(mj.mj_step, data, locked)
+        if locked.any():
+            # All drives have unit gear, actuatorgravcomp and one actuator per joint.
+            raw = data.actuator_force + data.qfrc_gravcomp[self.dadr]
+            locked &= np.abs(raw) > self.rated
+        above = np.abs(data.qfrc_actuator[self.dadr]) > self.rated
+        overload[:] = np.where(locked, self.burst_steps, (overload + 1) * above)
+
+    def _integrate_or_forward(self, operation, data, locked):
+        with self._step_lock:
+            if not locked.any():
+                operation(self.model, data)
+                return
+            ids = self.drive_joints[locked]
+            self.model.jnt_actfrcrange[ids, 0] = -self.rated[locked]
+            self.model.jnt_actfrcrange[ids, 1] = self.rated[locked]
+            try:
+                operation(self.model, data)
+            finally:
+                self.model.jnt_actfrcrange[ids] = self.hard_range[locked]
+
+    def refresh(self, data, overload):
+        """Refresh a readback without advancing or re-arming a derated drive."""
+        self._integrate_or_forward(mj.mj_forward, data, overload >= self.burst_steps)
+
+    def advance(self, target):
+        target = np.asarray(target, dtype=float)
+        if (target.shape != (self.model.nu,) or not np.isfinite(target).all()
+                or (target < self.limits[:, 0]).any() or (target > self.limits[:, 1]).any()):
+            raise ValueError("Drive target is outside the model limits")
+        self.target = target.copy()
+        for _ in range(self.substeps):
+            self.step_control(self.data, target, self.overload)
+        self.refresh(self.data, self.overload)
+        self.periods += 1
+
+
 class Simulation:
-    def __init__(self):
-        scene_path, _ = model_paths(SIM_ROOT)
-        self.plant = Firefly(scene=scene_path)
+    def __init__(self, *, payload_kg=None):
+        scene, _ = model_paths(SIM_ROOT)
+        payloads = dict(payload_kg or {})
+        if payloads.keys() - set(SIDES) or any(not np.isfinite(m) or m < 0 for m in payloads.values()):
+            raise ValueError("Supply a finite nonnegative TCP payload in kg per arm")
+        if not any(payloads.values()):
+            self.plant = GuardedFirefly(scene)
+            return
+        # A compact known load at the calibrated TCP contributes to both inertia
+        # and compensated gravity; the latter is included in the motor limit.
+        tree = ET.parse(scene)
+        for s, mass in payloads.items():
+            if mass == 0:
+                continue
+            wrist = tree.find(f".//body[@name='{s}_link_6']")
+            site = wrist.find(f"site[@name='{s}_tcp']")
+            load = ET.SubElement(wrist, "body", name=f"{s}_payload", pos=site.attrib["pos"], gravcomp="1")
+            inertia = .4 * mass * .001**2  # solid sphere of radius 1 mm
+            ET.SubElement(load, "inertial", pos="0 0 0", mass=str(mass), diaginertia=" ".join([str(inertia)] * 3))
+        with NamedTemporaryFile(dir=scene.parent, suffix=".xml") as stream:
+            tree.write(stream, encoding="utf-8")
+            stream.flush()
+            self.plant = GuardedFirefly(stream.name)
+
+    def unsustainable_hold(self, scratch):
+        """Static joint effort at this configuration; the input must be scratch data."""
+        p = self.plant
+        scratch.qvel[:] = 0
+        mj.mj_forward(p.model, scratch)
+        # Full compensated gravity enters the actuator force on these unit-gear hinges.
+        # Account for externally applied joint torques and body wrenches, if supplied.
+        applied = scratch.qfrc_applied.copy()
+        for bid in np.flatnonzero(np.any(scratch.xfrc_applied, axis=1)):
+            wrench = scratch.xfrc_applied[bid]
+            mj.mj_applyFT(p.model, scratch, wrench[:3], wrench[3:], scratch.xipos[bid], bid, applied)
+        demand = np.abs((scratch.qfrc_bias - applied)[p.dadr])
+        over = np.flatnonzero(demand > p.rated + 1e-9)
+        return {p.model.actuator(i).name: float(demand[i]) for i in over}
 
     def close(self):
         self.plant.close()
@@ -62,43 +171,7 @@ class Simulation:
         return sim_fk(self.plant, side, joint_vector(self.plant, side, joints))
 
     def execute(self, joints_by_arm, targets_by_arm, *, max_periods=80):
-        """Validate all candidates in scratch state, then drive the chosen arms together."""
-        sides = set(joints_by_arm)
-        if not sides or sides != set(targets_by_arm) or sides.difference(SIDES):
-            raise ValueError("Supply matching joints and TCP targets for left, right, or both arms")
-        if not isinstance(max_periods, int) or max_periods < 1:
-            raise ValueError("max_periods must be a positive integer")
-
-        goals = {side: normalized_pose(pose) for side, pose in targets_by_arm.items()}
-        command = self.plant.target.copy()
-        candidates_ok = True
-        candidate_errors = {}
-        for side, joints in joints_by_arm.items():
-            errors = pose_error(self.fk(side, joints), goals[side])
-            candidate_errors[side] = dict(position_error_m=errors[0], orientation_error_rad=errors[1])
-            candidates_ok = candidates_ok and within_tolerance(errors)
-            command[self.plant.arm_drives[side]] = joints
-
-        periods = 0
-        status = "candidate_fk_failed"
-        if candidates_ok:
-            status = "tracking_timeout"
-            stable_periods = 0
-            for periods in range(1, max_periods + 1):
-                self.plant.advance(command)
-                at_goal = all(within_tolerance(pose_error(self.tcp(side), goal))
-                              for side, goal in goals.items())
-                stable_periods = stable_periods + 1 if at_goal else 0
-                if stable_periods >= 3:
-                    status = "reached"
-                    break
-
-        measured = {}
-        for side, goal in goals.items():
-            position, orientation = self.tcp(side)
-            distance, angle = pose_error((position, orientation), goal)
-            measured[side] = dict(joints_rad=self.joints(side).tolist(), xyz_m=position.tolist(),
-                                  quat_wxyz=orientation.tolist(), position_error_m=distance,
-                                  orientation_error_rad=angle)
-        return dict(status=status, reached=status == "reached", periods=periods,
-                    sim_time_s=float(self.plant.data.time), arms=measured, candidate_errors=candidate_errors)
+        """Plan and execute a requested joint branch after checking its TCP goals."""
+        from motion import move_to
+        return move_to(self, {side: [q] for side, q in joints_by_arm.items()},
+                       targets_by_arm, max_periods=max_periods)

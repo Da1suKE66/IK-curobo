@@ -1,6 +1,6 @@
 # Firefly 双臂 cuRobo IK 控制
 
-给定工作台坐标系中的 TCP 位姿，控制器用 NVIDIA cuRobo 在 GPU 上求出六轴关节角，在 MuJoCo 里驱动对应手臂，并读取实际到达的 TCP 位姿。[已知问题](KNOWN_ISSUES.md) · [完整测试报告](audit_results/REPORT.md)
+给定工作台坐标系中的 TCP 位姿，控制器用 NVIDIA cuRobo 在 GPU 上求出六轴关节角，在 MuJoCo 里驱动对应手臂，并读取实际到达的 TCP 位姿。[已知问题](KNOWN_ISSUES.md) · [修复与回归验收](audit_results/REGRESSION_FIXES.md)
 
 ## 安装
 
@@ -29,7 +29,7 @@ python3.11 -m venv .venv
 ./ik state   # 查看两臂当前的关节角和 TCP 位姿
 ./ik demo    # 两臂保持各自朝向，一起沿工作台 X 移动 18 mm、沿 Z 抬高 8 mm
 ./ik verify  # 运行随包 IK 用例及双臂控制验证
-./ik audit --trace audit_results/motor_traces.npz > audit_results/results.json
+./ik audit --trace audit_results/motor_after.npz > audit_results/audit_after.json
 ```
 
 以下命令驱动左臂到指定位置和朝向。将 `move` 换为 `solve` 可以只求解并检查末端误差。右臂使用 `--right`，也可以在同一条命令中分别传入两侧的目标。
@@ -42,13 +42,18 @@ python3.11 -m venv .venv
 
 ## 控制与验收
 
-每侧求解器从导出的 URDF 读取运动链和标定基座，从 MuJoCo 场景读取 TCP 变换。[硬件参数](hardware.py) 按厂家数据生成 `hardware_model/` 下的 MJCF 和 URDF，控制器的仿真与求解入口都加载这两个文件。cuRobo 使用多初值求解，并在收敛候选中选择最接近当前实测关节角的解。双臂独立求解，两侧目标均通过 MuJoCo 正运动学复核后，在同一个物理实例中同步执行。单臂运动时，另一臂和夹爪保持原控制设定。当前实现执行关节空间位置伺服，未启用 cuRobo 避障规划。
+每侧使用 cuRobo 的 GPU 多初值求解、Firefly 几何分支以及上一帧关节角。求解器在标定的运动链上用双精度细化候选，并复核活动范围和 TCP。点位运动对双臂候选组合尝试同步、先左、先右和不同运动时长；每条轨迹先用完整 MuJoCo 场景按 2 ms 预演。执行端复查接触、关节行程和速度。第 3、5 连杆的碰撞网格由原 STL 分区生成。[硬件配置](hardware.py) · [点位规划](motion.py)
 
-`move` 的控制周期为 0.1 s，物理步长为 2 ms。每一步用整臂速度规格限制位置指令的斜率，用电机峰值力矩限制关节输出。所有请求手臂的位置误差小于 0.4 mm、姿态误差小于 0.004 rad，且连续保持三个控制周期时，返回 `reached`。这一状态只表示末端到位，运动中仍可能发生接触或短时超额定力矩。`arms` 给出最终实测关节角、TCP 位姿和跟踪误差。`candidate_errors` 给出执行前求解结果的几何误差。返回 `ik_failed` 或 `candidate_fk_failed` 时没有执行本次请求。`tracking_timeout` 表示已执行但在规定时间内未稳定到位。
+| 输出轴 | 额定力矩 | 仿真硬上限 | 连续超额定时限 |
+| --- | ---: | ---: | ---: |
+| 每侧 J1–J4 | 9 N·m | 20 N·m | 2.000 s |
+| 每侧 J5–J7（含主动夹爪） | 3 N·m | 5 N·m | 2.000 s |
 
-标准输出为 JSON。退出码 0 表示成功，1 表示求解、跟踪或验证未通过，2 表示输入或运行环境错误。`audit` 检出碰撞、漏解或超限等问题时会写出完整报告并返回 1。[电机与双臂测试结果](audit_results/REPORT.md)
+每台电机独立计时。第 1000 个连续超额定物理步后，下一个物理步按额定值限幅；未限幅需求回到额定范围后才重新开放短时余量。守卫计入重力补偿，计时跨命令延续。规划器还检查目标静止时所需的输出力矩。已知集中载荷可以用 `./ik --payload-kg 0.25 0.25 demo` 指定，顺序为左、右 TCP，单位 kg。
 
-更新硬件参数后，RTX 4090 上重新运行的 14 项基线检查全部通过，包括 10 个可达位姿、2 个不可达目标、双臂请求失败时的状态保持和双臂同步运动。最后一项在 0.7 秒仿真时间内稳定到位，左、右 TCP 的位置误差分别为 0.157 mm 和 0.146 mm。运行 `./ik verify > verification.json` 可保存基线结果。
+`move` 返回 `reached` 时，所有请求手臂的 TCP 位置误差小于 0.4 mm、姿态误差小于 0.004 rad，且最大臂关节速度小于 0.01 rad/s，连续满足三个 100 ms 周期。预演还检查随后 2.4 s 的保持。返回的 `selected_joints_rad` 为几何解，`command_joints_rad` 为实际伺服终点；贴机械限位时，伺服端预留 10 µrad。几何求解失败返回 `ik_failed`，执行前找不到合规动作返回 `motion_rejected`，`first_failure` 和 `rejected_trials` 记录原因。执行中监测到异常则中断并返回 `motion_interrupted`。
+
+`./ik track path.json` 接收带时间戳的 TCP 路点。JSON 字段为 `times_s`、`targets_by_arm` 和可选的 `hold_s`（默认 0.4 s）。每侧按时间给出 `[[x,y,z],[qw,qx,qy,qz]]`，首帧对应当前实测 TCP，从 0 秒起，末端时间落在物理时钟上。控制器按静止起停边界进行三次插值，在每个物理步加入速度和逆动力学前馈。标准输出为 JSON，退出码 0 表示成功，1 表示验收、求解或跟踪失败，2 表示输入或环境错误。[轨迹实现](trajectory.py) · [复跑命令和逐项指标](audit_results/REGRESSION_FIXES.md)
 
 ### 在同一个实例中连续控制
 

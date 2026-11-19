@@ -15,16 +15,27 @@ from simulation import SIM_ROOT, Simulation, pose_error, within_tolerance
 from solver import Solver
 
 
+class RawGpuSolver(Solver):
+    """Return the unrefined cuRobo branch for the historical LM A/B experiment."""
+
+    def solve(self, xyz_m, quat_wxyz, seed_rad):
+        candidates = self._gpu_seeds(xyz_m, quat_wxyz / np.linalg.norm(quat_wxyz), seed_rad)
+        if len(candidates) == 0:
+            return None
+        return min(candidates, key=lambda q: np.linalg.norm(q - seed_rad))
+
+
 def run_group(sim, *, full_interval):
     # Recreate the solver with identical RNG initialization and target/seed order.
     torch.manual_seed(SAMPLE_SEED)
-    solver = Solver(SIM_ROOT, "left")
+    solver = RawGpuSolver(SIM_ROOT, "left")
     lm = solver._ik.seed_ik_solver
-    if full_interval:
-        # Modify only the LM's internal iteration bounds before its first CUDA
-        # graph capture. Sampler settings and physical actuator stops stay fixed.
-        lm.action_min.copy_(lm.joint_limits.position[0])
-        lm.action_max.copy_(lm.joint_limits.position[1])
+    if not full_interval:
+        # Restore upstream's soft inset just for the control group.
+        lower, upper = lm.joint_limits.position
+        margin = (upper - lower) * lm.config.joint_limit_margin
+        lm.action_min.copy_(lower + margin)
+        lm.action_max.copy_(upper - margin)
     inset = (lm.action_min - lm.joint_limits.position[0]).tolist()
     limits = sim.plant.limits[sim.plant.arm_drives["left"]]
     results = reachability(sim, "left", solver, sim.joints("left"), limits)
@@ -48,6 +59,6 @@ if __name__ == "__main__":
     with redirect_stdout(sys.stderr), closing(Simulation()) as sim:
         result = dict(arm="left", torch_seed=SAMPLE_SEED, roundoff_threshold_rad=1e-7,
                       curobo_version=version("nvidia-curobo"), device=torch.cuda.get_device_name(),
-                      production_interval=run_group(sim, full_interval=False),
+                      upstream_default_interval=run_group(sim, full_interval=False),
                       full_physical_interval=run_group(sim, full_interval=True))
     print(json.dumps(result, indent=2, allow_nan=False))

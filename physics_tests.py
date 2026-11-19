@@ -1,12 +1,13 @@
 """Inspect every physics step of the Firefly controller in the MuJoCo workcell."""
+from contextlib import closing
 from unittest.mock import patch
 
 import mujoco as mj
 import numpy as np
 
 from collision_tests import contact_kind
-from hardware import PEAK_TORQUE_NM, RATED_TORQUE_NM
-from simulation import SIDES, pose_error, within_tolerance
+from hardware import MAX_OVERLOAD_S, SIM_TORQUE_LIMIT_NM, RATED_TORQUE_NM
+from simulation import SIDES, Simulation, pose_error, within_tolerance
 
 
 class StepTrace:
@@ -100,7 +101,7 @@ class StepTrace:
             self.hold_error = np.maximum(self.hold_error, pose_error(self.sim.tcp(self.held), self.hold_pose))
 
     def summarize(self):
-        rated, peak = np.tile(RATED_TORQUE_NM, 2), np.tile(PEAK_TORQUE_NM, 2)
+        rated, peak = np.tile(RATED_TORQUE_NM, 2), np.tile(SIM_TORQUE_LIMIT_NM, 2)
         torque = np.asarray(self.torque).reshape(-1, len(self.drives))
         above = np.abs(torque) > rated + 1.e-8
         longest = np.zeros(len(self.drives), dtype=int)
@@ -118,6 +119,7 @@ class StepTrace:
                       total_above_rated_s=(above.sum(axis=0)*self.dt).tolist(),
                       longest_above_rated_s=(longest*self.dt).tolist(),
                       rated_exceeded=bool(np.any(above)),
+                      duration_exceeded=bool(np.any(longest*self.dt > MAX_OVERLOAD_S + 1e-12)),
                       peak_exceeded=bool(np.any(abs_peak > peak + 1.e-8)),
                       steps_above_peak=(np.abs(torque) > peak + 1.e-8).sum(axis=0).tolist(),
                       time_at_peak_s=((np.abs(torque) >= peak - 1.e-8).sum(axis=0)*self.dt).tolist(),
@@ -153,8 +155,11 @@ def run_physics_tests(sim, controller, *, traces=None):
     plant, model, data = sim.plant, sim.plant.model, sim.plant.data
     cases = []
 
-    def observe(name, category, action, *, held=None, load_kg=0.):
-        trace = StepTrace(sim, held, load_kg, keep_samples=traces is not None)
+    def observe(name, category, action, *, held=None, test_sim=sim, rejection=None):
+        trace = StepTrace(test_sim, held, keep_samples=traces is not None)
+        p = test_sim.plant
+        initial = (p.data.time, p.data.qpos.copy(), p.data.qvel.copy(), p.data.ctrl.copy(), p.target.copy(),
+                   p.overload.copy())
         with patch.object(mj, "mj_step", new=trace.step):
             result = action()
         telemetry = trace.summarize()
@@ -165,10 +170,15 @@ def run_physics_tests(sim, controller, *, traces=None):
                 traces[f"{name}_{suffix}"] = np.asarray(samples).reshape(-1, len(trace.drives))
         reached = result["status"] == "reached"
         within = (telemetry["steps"] > 0 and reached and not telemetry["collision_steps"]
-                  and not telemetry["rated_exceeded"] and not telemetry["peak_exceeded"]
-                  and not telemetry["velocity_exceeded"] and not telemetry["command_slew_exceeded"]
+                  and not telemetry["duration_exceeded"] and not telemetry["peak_exceeded"]
+                  and not telemetry["velocity_exceeded"] and not telemetry["gripper_speed_above_model_slew"]
+                  and not telemetry["command_slew_exceeded"]
                   and not telemetry["qstep_exceeds_speed_budget"] and telemetry.get("hold", {}).get("passed", True))
-        cases.append(dict(name=name, category=category, result=result, telemetry=telemetry,
+        if rejection and result["status"] == "motion_rejected":
+            final = (p.data.time, p.data.qpos, p.data.qvel, p.data.ctrl, p.target, p.overload)
+            within = (result.get("reason") == rejection and telemetry["steps"] == 0
+                      and all(np.array_equal(a, b) for a, b in zip(initial, final)))
+        cases.append(dict(accepted_rejection=rejection, name=name, category=category, result=result, telemetry=telemetry,
                           all_monitored_limits_met=bool(within)))
 
     for side, held in (("left", "right"), ("right", "left")):
@@ -191,10 +201,19 @@ def run_physics_tests(sim, controller, *, traces=None):
     plant.reset()
     home = {side: sim.tcp(side) for side in SIDES}
     goals = {}
+    outward = {}
     for side, sign in (("left", 1), ("right", -1)):
         q = sim.joints(side) + np.array([0.80*sign, 0.70, -0.45, -0.50, 0.85*sign, 1.2*sign])
         goals[side] = sim.fk(side, q)
-    observe("large_dual_move_outward", "stress", lambda: controller.run(goals, move=True))
+        outward[side] = q
+    observe("large_dual_move_outward", "stress", lambda: controller.run(goals, move=True), rejection="static_torque")
+    # Start the independent return challenge at the original extended configuration.
+    # A rejected outbound command would otherwise make the return a zero-distance test.
+    for side, q in outward.items():
+        drives = plant.arm_drives[side]
+        data.qpos[plant.qadr[drives]] = data.ctrl[drives] = q
+    plant.target = data.ctrl.copy()
+    plant.refresh(data, plant.overload)
     observe("large_dual_move_return", "stress", lambda: controller.run(home, move=True))
 
     plant.reset()
@@ -204,7 +223,7 @@ def run_physics_tests(sim, controller, *, traces=None):
         q[0] += sign*0.38
         goals[side] = sim.fk(side, q)
     observe("both_shoulders_turn_inward_0.38_rad", "collision_challenge",
-            lambda: controller.run(goals, move=True))
+            lambda: controller.run(goals, move=True), rejection="collision")
 
     plant.reset()
 
@@ -225,32 +244,26 @@ def run_physics_tests(sim, controller, *, traces=None):
 
     extended_q = [0., 1.15, 0.25, 0.10, 0., 0.]
 
-    def static_hold(goals, load):
-        for _ in range(15):
-            plant.advance(plant.target)
-        errors = {side: pose_error(sim.tcp(side), goals[side]) for side in SIDES}
-        return dict(status="reached" if all(within_tolerance(v) for v in errors.values()) else "hold_drift",
-                    per_tcp_mass_equivalent_kg=load, held_joint_setpoint_rad=extended_q,
-                    tcp_final_error_m_rad=errors)
-
-    for name, load in (("extended_hold_unloaded", 0.), ("extended_hold_at_1.5kg_per_tcp", 1.5)):
-        plant.reset()
-        for side in SIDES:
-            drives = plant.arm_drives[side]
-            data.qpos[plant.qadr[drives]] = extended_q
-            data.ctrl[drives] = extended_q
-        plant.target = data.ctrl.copy()
-        mj.mj_forward(model, data)
-        goals = {side: sim.tcp(side) for side in SIDES}
-        observe(name, "load_stress", lambda: static_hold(goals, load), load_kg=load)
+    from control import Controller
+    for name, mass in (("extended_hold_unloaded", 0.), ("extended_hold_at_1.5kg_per_tcp", 1.5),
+                       ("near_home_hold_at_0.25kg_per_tcp", .25)):
+        with closing(Simulation(payload_kg={side: mass for side in SIDES})) as loaded:
+            loaded_control = Controller(loaded)
+            loaded_control.solvers.update(controller.solvers)  # Payload has no effect on kinematics.
+            if mass == .25:
+                goals = offset_goals(loaded, {s: [.003, 0., -.002] for s in SIDES})
+            else:
+                goals = {s: loaded.fk(s, extended_q) for s in SIDES}
+            observe(name, "load_stress", lambda: loaded_control.run(goals, move=True), test_sim=loaded,
+                    rejection="static_torque" if mass != .25 else None)
     plant.reset()
     nominal = [c for c in cases if c["category"] == "nominal"]
-    completed = all(c["telemetry"]["steps"] > 0 for c in cases)
+    completed = all(c["telemetry"]["steps"] > 0 or c["result"]["status"] == "motion_rejected" for c in cases)
     return dict(completed=completed, nominal_passed=all(c["all_monitored_limits_met"] for c in nominal),
                 sample_period_s=float(model.opt.timestep),
                 joint_order=[f"{side}_J{i}" for side in SIDES for i in range(1,8)],
                 rated_torque_Nm=np.tile(RATED_TORQUE_NM,2).tolist(),
-                peak_torque_Nm=np.tile(PEAK_TORQUE_NM,2).tolist(),
+                sim_limit_Nm=np.tile(SIM_TORQUE_LIMIT_NM,2).tolist(),
                 velocity_budget_rad_s=(plant.max_step / model.opt.timestep)[trace_drive_order(plant)].tolist(),
                 penetration_threshold_m=1.e-6, cases=cases)
 

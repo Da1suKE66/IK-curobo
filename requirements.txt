@@ -3,3 +3,4 @@ nvidia-curobo[cu12-torch] @ git+https://github.com/NVlabs/curobo.git@42498cf4e7d
 cuda-bindings==12.9.10
 cuda-core==1.3.1
 warp-lang==1.19.0
+scipy==1.17.1

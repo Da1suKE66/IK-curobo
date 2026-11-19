@@ -13,6 +13,8 @@ import xml.etree.ElementTree as ET
 
 import numpy as np
 
+from collision_geometry import refine_collision_meshes
+
 
 # HexFellow Firefly Y6 assembly specifications. J7 drives the gripper; the
 # arm table lists six axes, so the gripper keeps the packaged travel and slew.
@@ -21,7 +23,9 @@ ARM_SPEED_DEG_S = (320, 320, 320, 320, 720, 720)
 # Output-shaft ratings from HEX 4342P (J1..4) and HEX 4310 (J5..7).
 # Do not multiply these torques by the built-in planetary reduction again.
 RATED_TORQUE_NM = (9., 9., 9., 9., 3., 3., 3.)
-PEAK_TORQUE_NM = (30., 30., 30., 30., 7., 7., 7.)
+MOTOR_PEAK_TORQUE_NM = (30., 30., 30., 30., 7., 7., 7.)
+SIM_TORQUE_LIMIT_NM = (20., 20., 20., 20., 5., 5., 5.)
+MAX_OVERLOAD_S = 2.0
 
 
 def _save(tree, path):
@@ -51,7 +55,7 @@ def model_paths(sim_root):
     robot = ET.parse(source / robot_path.name)
 
     for side in ("left", "right"):
-        for j, peak in enumerate(PEAK_TORQUE_NM, 1):
+        for j, peak in enumerate(SIM_TORQUE_LIMIT_NM, 1):
             name = f"{side}_joint_{j}" if j <= 6 else f"{side}_grip_joint_1"
             joint = scene.find(f".//worldbody//joint[@name='{name}']")
             drive = scene.find(f"actuator/position[@joint='{name}']")
@@ -75,6 +79,7 @@ def model_paths(sim_root):
     for tree, attr in ((scene, "file"), (robot, "filename")):
         for mesh in tree.iter("mesh"):
             mesh.set(attr, os.path.relpath(source / mesh.attrib[attr], output))
+    refine_collision_meshes(scene, output)
     _save(scene, scene_path)
     _save(robot, robot_path)
     return scene_path, robot_path
@@ -112,9 +117,9 @@ def verify_hardware(sim, controller):
             aid = model.actuator(name).id
             bounds = list(map(radians, ARM_RANGE_DEG[j])) if j < 6 else [0., .6]
             speed = radians(ARM_SPEED_DEG_S[j]) if j < 6 else 1.5
-            peak = PEAK_TORQUE_NM[j]
+            peak = SIM_TORQUE_LIMIT_NM[j]
             records[name] = dict(position_rad=bounds, max_speed_rad_s=speed,
-                                 rated_nm=RATED_TORQUE_NM[j], peak_nm=peak)
+                                 rated_nm=RATED_TORQUE_NM[j], sim_limit_nm=peak, motor_peak_nm=MOTOR_PEAK_TORQUE_NM[j])
             check(name, "mujoco_limit_flags", [model.jnt_limited[jid], model.jnt_actfrclimited[jid],
                                                model.actuator_ctrllimited[aid]], [1, 1, 1])
             check(name, "mujoco_position", model.jnt_range[jid], bounds)
