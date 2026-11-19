@@ -1,0 +1,6 @@
+/.venv/
+__pycache__/
+*.py[cod]
+/firefly-sim-ik/
+/firefly-sim-ik-linux-x86_64.tar.gz
+/hardware_model/
